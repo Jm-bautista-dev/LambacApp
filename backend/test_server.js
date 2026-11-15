@@ -724,7 +724,176 @@ async function runTests() {
     assert.strictEqual(paidOrderCreateRes.json.error, 'OrderAlreadyPaid');
     console.log('✅ 10. Webhook verification, invalid signature rejection, and duplicate webhook idempotency verified');
 
-    console.log('\n🎉 ALL 10 BACKEND UNIT & HTTP INTEGRATION TEST SUITES PASSED!');
+    // 2J. Extended Webhook Audit Scenarios (All 10 Required Edge Cases)
+    function signWebhookBody(bodyStr, timestampSec = Math.floor(Date.now() / 1000), secret = testSecret) {
+      const sig = crypto.createHmac('sha256', secret).update(`${timestampSec}.${bodyStr}`).digest('hex');
+      return `t=${timestampSec},te=${sig}`;
+    }
+
+    // Scenario 5: Missing Paymongo-Signature header -> 400
+    const missingSigRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      body: webhookEventPayload,
+    });
+    assert.strictEqual(missingSigRes.status, 400);
+    assert.strictEqual(missingSigRes.json.error, 'InvalidSignature');
+
+    // Scenario 6: Missing PAYMONGO_WEBHOOK_SECRET -> 400 fail-closed
+    const savedWebhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET;
+    delete process.env.PAYMONGO_WEBHOOK_SECRET;
+    try {
+      const noSecretRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+        headers: { 'Paymongo-Signature': signWebhookBody(webhookEventPayload) },
+        body: webhookEventPayload,
+      });
+      assert.strictEqual(noSecretRes.status, 400);
+      assert.strictEqual(noSecretRes.json.error, 'InvalidSignature');
+    } finally {
+      process.env.PAYMONGO_WEBHOOK_SECRET = savedWebhookSecret;
+    }
+
+    // Scenario 7: Expired signature timestamp (> 600s old) -> 400
+    const expiredTs = Math.floor(Date.now() / 1000) - 605;
+    const expiredSigRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(webhookEventPayload, expiredTs) },
+      body: webhookEventPayload,
+    });
+    assert.strictEqual(expiredSigRes.status, 400);
+    assert.strictEqual(expiredSigRes.json.error, 'InvalidSignature');
+
+    // Scenario 2: Valid signed payment.paid event on a pending order -> 200 & marks PAID
+    await mockDb.collection('orders').doc('ord_lmb_pay_paid_1').set({
+      id: 'ord_lmb_pay_paid_1',
+      order_number: 'LMB-PAY-PAID-1',
+      customer_id: 'cust_1',
+      payment_status: 'PENDING',
+      status: 'pending',
+      total_amount: 250,
+    });
+    const paymentPaidPayload = JSON.stringify({
+      data: {
+        id: 'evt_payment_paid_2001',
+        attributes: {
+          type: 'payment.paid',
+          data: {
+            id: 'pay_direct_2001',
+            attributes: {
+              amount: 25000,
+              status: 'paid',
+              metadata: { order_id: 'ord_lmb_pay_paid_1', customer_id: 'cust_1' },
+            },
+          },
+        },
+      },
+    });
+    const paymentPaidRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(paymentPaidPayload) },
+      body: paymentPaidPayload,
+    });
+    assert.strictEqual(paymentPaidRes.status, 200);
+    assert.strictEqual(mockDb._dump('orders', 'ord_lmb_pay_paid_1').payment_status, 'PAID');
+    assert.strictEqual(mockDb._dump('orders', 'ord_lmb_pay_paid_1').payment_reference, 'pay_direct_2001');
+
+    // Scenario 3a: Valid signed payment.failed event on a pending order -> marks FAILED
+    await mockDb.collection('orders').doc('ord_lmb_pay_fail_1').set({
+      id: 'ord_lmb_pay_fail_1',
+      order_number: 'LMB-PAY-FAIL-1',
+      customer_id: 'cust_fail_1',
+      payment_status: 'PENDING',
+      status: 'pending',
+      total_amount: 180,
+    });
+    const paymentFailedPayload = JSON.stringify({
+      data: {
+        id: 'evt_payment_failed_3001',
+        attributes: {
+          type: 'payment.failed',
+          data: {
+            id: 'pay_fail_3001',
+            attributes: {
+              failed_message: 'Insufficient GCash balance',
+              metadata: { order_id: 'ord_lmb_pay_fail_1', customer_id: 'cust_fail_1' },
+            },
+          },
+        },
+      },
+    });
+    const paymentFailedRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(paymentFailedPayload) },
+      body: paymentFailedPayload,
+    });
+    assert.strictEqual(paymentFailedRes.status, 200);
+    assert.strictEqual(mockDb._dump('orders', 'ord_lmb_pay_fail_1').payment_status, 'FAILED');
+    assert.strictEqual(
+      mockDb._dump('first_order_reservations', 'cust_fail_1').status,
+      'RELEASED_FOR_RETRY'
+    );
+
+    // Scenario 3b: payment.failed CANNOT overwrite an already PAID order
+    const failedOnPaidPayload = JSON.stringify({
+      data: {
+        id: 'evt_payment_failed_on_paid_3002',
+        attributes: {
+          type: 'payment.failed',
+          data: {
+            id: 'pay_fail_3002',
+            attributes: {
+              failed_message: 'Late failure event',
+              metadata: { order_id: 'ord_lmb_1001', customer_id: 'cust_1' },
+            },
+          },
+        },
+      },
+    });
+    const failedOnPaidRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(failedOnPaidPayload) },
+      body: failedOnPaidPayload,
+    });
+    assert.strictEqual(failedOnPaidRes.status, 200);
+    assert.strictEqual(mockDb._dump('orders', 'ord_lmb_1001').payment_status, 'PAID');
+
+    // Scenario 9: Unknown event type -> 200 acknowledged without mutating orders
+    const unknownEventPayload = JSON.stringify({
+      data: {
+        id: 'evt_unknown_4001',
+        attributes: {
+          type: 'source.chargeable',
+          data: { id: 'src_4001', attributes: {} },
+        },
+      },
+    });
+    const unknownEventRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(unknownEventPayload) },
+      body: unknownEventPayload,
+    });
+    assert.strictEqual(unknownEventRes.status, 200);
+    assert.strictEqual(unknownEventRes.json.received, true);
+
+    // Scenario 10: Event referencing a nonexistent order -> 200 without crashing or creating order
+    const nonexistentOrderPayload = JSON.stringify({
+      data: {
+        id: 'evt_missing_order_5001',
+        attributes: {
+          type: 'checkout_session.payment.paid',
+          data: {
+            id: 'cs_missing_5001',
+            attributes: {
+              metadata: { order_id: 'ord_does_not_exist_999' },
+              payments: [{ id: 'pay_missing_5001', attributes: { amount: 15000, status: 'paid' } }],
+            },
+          },
+        },
+      },
+    });
+    const nonexistentOrderRes = await requestHttp(baseUrl, 'POST', '/api/paymongo-webhook', {
+      headers: { 'Paymongo-Signature': signWebhookBody(nonexistentOrderPayload) },
+      body: nonexistentOrderPayload,
+    });
+    assert.strictEqual(nonexistentOrderRes.status, 200);
+    assert.strictEqual(mockDb._dump('orders', 'ord_does_not_exist_999'), undefined);
+
+    console.log('✅ 11. Extended webhook audit scenarios (payment.paid, payment.failed, missing/expired sig, missing secret, unknown event, nonexistent order) verified');
+
+    console.log('\n🎉 ALL 11 BACKEND UNIT & HTTP INTEGRATION TEST SUITES PASSED!');
   } finally {
     server.close();
     setTestOverrides({});
