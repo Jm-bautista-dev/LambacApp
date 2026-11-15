@@ -1,0 +1,828 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // Core Role Resolution & Authentication Helpers
+    // =========================================================================
+
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function userDocExists() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function getUserRole() {
+      return userDocExists() ? getUserData().get('role', '') : '';
+    }
+
+    function isAccountActive() {
+      return !userDocExists() || (
+        getUserData().get('status', 'active') != 'disabled' &&
+        getUserData().get('isActive', true) != false &&
+        getUserData().get('is_active', true) != false
+      );
+    }
+
+    function hasCompletedFirstOrder() {
+      return !userDocExists() ||
+             (
+               getUserData().get('first_order_gcash_completed', true) != false &&
+               getUserData().get('firstOrderGcashCompleted', true) != false
+             ) ||
+             getUserData().get('first_order_gcash_completed', false) == true ||
+             getUserData().get('firstOrderGcashCompleted', false) == true ||
+             (
+               exists(/databases/$(database)/documents/first_order_reservations/$(request.auth.uid)) &&
+               get(/databases/$(database)/documents/first_order_reservations/$(request.auth.uid)).data.get('status', '') == 'COMPLETED'
+             );
+    }
+
+    function isBootstrapSuperAdmin() {
+      return isAuthenticated() &&
+             'email' in request.auth.token &&
+             (request.auth.token.email == 'jmbautista0228@gmail.com' || request.auth.token.email == 'jmbautistaa0428@gmail.com');
+    }
+
+    function hasSuperAdminSystemRole() {
+      return exists(/databases/$(database)/documents/systemRoles/superAdmins) &&
+             request.auth.uid in get(/databases/$(database)/documents/systemRoles/superAdmins).data.get('uids', []);
+    }
+
+    // Super Admin: Custom Claim OR Document Role == 'super_admin' OR Verified Bootstrap Email OR System Role Registry
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        ('role' in request.auth.token && request.auth.token.role == 'super_admin') ||
+        ('is_super_admin' in request.auth.token && request.auth.token.is_super_admin == true) ||
+        isBootstrapSuperAdmin() ||
+        (userDocExists() && getUserData().get('role', '') == 'super_admin') ||
+        hasSuperAdminSystemRole()
+      );
+    }
+
+    // Admin: Super Admin OR Custom Claim OR Document Role in ['admin', 'administrator', 'super_admin']
+    function isAdmin() {
+      return isAuthenticated() && (
+        ('role' in request.auth.token && request.auth.token.role in ['admin', 'super_admin']) ||
+        isBootstrapSuperAdmin() ||
+        (userDocExists() && getUserData().get('role', '') in ['admin', 'administrator', 'super_admin']) ||
+        hasSuperAdminSystemRole()
+      );
+    }
+
+    // Barista / Employee: Admin OR Custom Claim OR Document Role in ['barista', 'employee', 'staff']
+    function isBarista() {
+      return isAuthenticated() && (
+        ('role' in request.auth.token && request.auth.token.role in ['barista', 'employee', 'staff', 'admin', 'super_admin']) ||
+        isBootstrapSuperAdmin() ||
+        (userDocExists() && getUserData().get('role', '') in ['barista', 'employee', 'staff', 'admin', 'administrator', 'super_admin']) ||
+        hasSuperAdminSystemRole()
+      );
+    }
+
+    // Customer: Authenticated user who is not staff or admin
+    function isCustomer() {
+      return isAuthenticated() && !isBarista();
+    }
+
+    // Authorized Staff Inbox & Concierge Chat Support Access
+    function canAccessInbox() {
+      return isAuthenticated() && (
+        isBootstrapSuperAdmin() ||
+        (
+          userDocExists() && (
+            getUserData().get('role', '') in ['admin', 'administrator', 'super_admin'] ||
+            (
+              getUserData().get('role', '') in ['barista', 'employee', 'staff'] &&
+              (
+                !('permissions' in getUserData()) ||
+                !(getUserData().permissions is list) ||
+                getUserData().permissions.size() == 0 ||
+                getUserData().permissions.hasAny(['manageInbox', 'manage_inbox'])
+              )
+            )
+          )
+        ) ||
+        hasSuperAdminSystemRole()
+      );
+    }
+
+    // Authorized Staff for Walk-in POS Sales Ledger Recording
+    function canRecordSales() {
+      return isAuthenticated() && (
+        isBootstrapSuperAdmin() ||
+        (
+          userDocExists() && (
+            getUserData().get('role', '') in ['admin', 'administrator', 'super_admin'] ||
+            (
+              getUserData().get('role', '') in ['barista', 'employee', 'staff'] &&
+              (
+                !('permissions' in getUserData()) ||
+                !(getUserData().permissions is list) ||
+                getUserData().permissions.size() == 0 ||
+                getUserData().permissions.hasAny(['recordSales', 'record_sales', 'manageOrders', 'manage_orders'])
+              )
+            )
+          )
+        ) ||
+        hasSuperAdminSystemRole()
+      );
+    }
+
+    function conversationExists(convId) {
+      return exists(/databases/$(database)/documents/conversations/$(convId));
+    }
+
+    function getParentConversation(convId) {
+      return get(/databases/$(database)/documents/conversations/$(convId)).data;
+    }
+
+    // Direct path ownership check — strictly ZERO get/exists calls!
+    function isDirectConversationOwner(convId) {
+      return isAuthenticated() && (
+        convId == 'conv_' + request.auth.uid ||
+        convId == 'conv_cust_' + request.auth.uid
+      );
+    }
+
+    function isConversationOwner(convId) {
+      return isDirectConversationOwner(convId) || (
+        isAuthenticated() && (
+          conversationExists(convId) && (
+            getParentConversation(convId).get('customer_id', '') == request.auth.uid ||
+            getParentConversation(convId).get('customerId', '') == request.auth.uid
+          )
+        )
+      );
+    }
+
+    // =========================================================================
+    // 1. User Profiles & Subcollections
+    // =========================================================================
+    match /users/{userId} {
+      // Read: Customer reads own profile; Barista and Admin can read accounts for operational lookups
+      allow read: if isOwner(userId) || isBarista() || isAdmin();
+
+      // Create:
+      // - Self-registration strictly provisions 'customer' role with no privileged permissions
+      // - Admins can provision 'employee', 'barista', or 'admin'
+      // - Super Admin can provision 'super_admin'
+      allow create: if (
+                      (
+                        isOwner(userId) && (
+                          (
+                            request.resource.data.role == 'customer'
+                            && (!('permissions' in request.resource.data) || request.resource.data.permissions.size() == 0)
+                            && (!('loyalty_points' in request.resource.data) || request.resource.data.loyalty_points <= 50)
+                            && (!('loyaltyPoints' in request.resource.data) || request.resource.data.loyaltyPoints <= 50)
+                            && (!('mustChangePassword' in request.resource.data) || request.resource.data.mustChangePassword == false)
+                            && (!('must_change_password' in request.resource.data) || request.resource.data.must_change_password == false)
+                            && (!('first_order_gcash_completed' in request.resource.data) || request.resource.data.first_order_gcash_completed == false)
+                            && (!('firstOrderGcashCompleted' in request.resource.data) || request.resource.data.firstOrderGcashCompleted == false)
+                            && (!('fullName' in request.resource.data) || (request.resource.data.fullName is string && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 100))
+                            && (!('full_name' in request.resource.data) || (request.resource.data.full_name is string && request.resource.data.full_name.size() >= 2 && request.resource.data.full_name.size() <= 100))
+                            && (!('email' in request.resource.data) || (request.resource.data.email is string && request.resource.data.email.size() <= 254))
+                          ) || (
+                            (request.auth.token.email == 'jmbautista0228@gmail.com' || request.auth.token.email == 'jmbautistaa0428@gmail.com')
+                          )
+                        )
+                      )
+                      ||
+                      (
+                        isAdmin() && (
+                          (request.resource.data.role in ['admin', 'employee', 'barista', 'staff', 'customer']) ||
+                          isSuperAdmin()
+                        )
+                      )
+                    )
+                    && (
+                      !('id' in request.resource.data) ||
+                      request.resource.data.id == userId ||
+                      request.resource.data.uid == userId
+                    );
+
+      // Update:
+      // - Self-service user profile updates are strictly restricted to an explicit whitelist of safe fields
+      // - Role, permissions, status, email, uid, loyalty points, and first-order verification flags are strictly immutable to self-service
+      // - Ordinary Admins cannot promote anyone to Super Admin or modify a Super Admin document
+      // - Ordinary Admins cannot tamper with identity keys (uid, id, email)
+      allow update: if (
+                      isOwner(userId) &&
+                      isAccountActive() &&
+                      request.resource.data.get('role', '') == resource.data.get('role', '') &&
+                      request.resource.data.get('first_order_gcash_completed', false) == resource.data.get('first_order_gcash_completed', false) &&
+                      request.resource.data.get('firstOrderGcashCompleted', false) == resource.data.get('firstOrderGcashCompleted', false) &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'full_name', 'fullName', 'displayName',
+                        'phone_number', 'phoneNumber',
+                        'avatar_url', 'avatarUrl',
+                        'terms_accepted', 'termsAccepted',
+                        'accepted_terms_version', 'acceptedTermsVersion',
+                        'terms_accepted_at', 'termsAcceptedAt', 'acceptance_updated_at',
+                        'mustChangePassword', 'must_change_password',
+                        'lastLoginAt', 'last_login_at',
+                        'favorite_product_ids',
+                        'fcm_device_token', 'token_updated_at',
+                        'is_registration_verified', 'isRegistrationVerified', 'registration_verified',
+                        'registration_verified_at', 'registrationVerifiedAt',
+                        'updatedAt', 'updated_at'
+                      ]) &&
+                      (!('mustChangePassword' in request.resource.data) || request.resource.data.mustChangePassword == false) &&
+                      (!('must_change_password' in request.resource.data) || request.resource.data.must_change_password == false) &&
+                      (!('is_registration_verified' in request.resource.data) || request.resource.data.is_registration_verified == true) &&
+                      (!('isRegistrationVerified' in request.resource.data) || request.resource.data.isRegistrationVerified == true)
+                    ) || (
+                      isAdmin() && (
+                        (
+                          resource.data.role != 'super_admin' &&
+                          request.resource.data.role != 'super_admin' &&
+                          (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid) &&
+                          (!('id' in request.resource.data) || request.resource.data.id == resource.data.id) &&
+                          (!('email' in request.resource.data) || request.resource.data.email == resource.data.email)
+                        ) ||
+                        isSuperAdmin()
+                      )
+                    );
+
+      // Delete: Users deleting own account (non-super admin) or Admin (Super Admin can only be deleted by Super Admin)
+      allow delete: if (isOwner(userId) && resource.data.role != 'super_admin')
+                    || (isAdmin() && (resource.data.role != 'super_admin' || isSuperAdmin()));
+
+      // Subcollection: Favorites
+      match /favorites/{productId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Subcollection: In-App Notifications
+      match /notifications/{notificationId} {
+        // Read: Customer can ONLY read their own notifications; Admin can inspect for audit
+        allow read: if isOwner(userId) || isAdmin();
+
+        // Update: Customer can update read-state flags only; all other fields are strictly immutable
+        allow update: if isOwner(userId) &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'is_read', 'read_at', 'isRead', 'readAt'
+                      ]);
+
+        // Create:
+        // - Staff / Admin can dispatch order or concierge notifications
+        // - Authenticated owner can create validated system event notifications for their own UID
+        allow create: if isAdmin()
+                      || isBarista()
+                      || (
+                        isOwner(userId)
+                        && request.resource.data.title is string
+                        && request.resource.data.title.size() > 0
+                        && request.resource.data.title.size() <= 120
+                        && request.resource.data.body is string
+                        && request.resource.data.body.size() > 0
+                        && request.resource.data.body.size() <= 500
+                        && (!('user_id' in request.resource.data) || request.resource.data.user_id == userId)
+                        && (!('userId' in request.resource.data) || request.resource.data.userId == userId)
+                      );
+
+        // Delete: Owner can dismiss/delete own notifications; Admin can manage
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+
+      // Subcollection: User Preferences
+      match /preferences/{prefId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // =========================================================================
+    // 2. Product Categories
+    // =========================================================================
+    match /categories/{categoryId} {
+      // Anyone can browse catalog categories
+      allow read: if true;
+
+      // Only Administrator can create, update, or delete categories
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 3. Products Catalog & Inventory
+    // =========================================================================
+    match /products/{productId} {
+      // Read:
+      // - Barista and Admin can read all products (for POS & inventory operations)
+      // - Public / Customer can ONLY read visible and published products
+      allow read: if isBarista() || (
+        resource.data.get('customer_visibility', 'visible') == 'visible' &&
+        resource.data.get('is_enabled', resource.data.get('isEnabled', true)) == true
+      );
+
+      // Create: Admin only, with strict schema boundaries
+      allow create: if isAdmin()
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() >= 2
+                    && request.resource.data.name.size() <= 120
+                    && (
+                      (request.resource.data.base_price is number && request.resource.data.base_price > 0 && request.resource.data.base_price <= 50000) ||
+                      (request.resource.data.price is number && request.resource.data.price > 0 && request.resource.data.price <= 50000)
+                    );
+
+      // Update:
+      // - Admin can update any product attributes
+      // - Barista can ONLY update inventory stock and availability, never prices or catalog naming
+      allow update: if (
+                      isAdmin()
+                      && request.resource.data.name is string
+                      && request.resource.data.name.size() >= 2
+                      && request.resource.data.name.size() <= 120
+                      && (
+                        (request.resource.data.base_price is number && request.resource.data.base_price > 0 && request.resource.data.base_price <= 50000) ||
+                        (request.resource.data.price is number && request.resource.data.price > 0 && request.resource.data.price <= 50000)
+                      )
+                    ) || (
+                      isBarista()
+                      && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                        'base_price', 'price', 'name', 'slug', 'category_id', 'categoryId', 'description'
+                      ])
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'stock_quantity', 'stock', 'availability', 'is_enabled', 'isEnabled', 'updated_at', 'updatedAt'
+                      ])
+                    );
+
+      // Delete: Admin only
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 4. Roastery Pickup Orders
+    // =========================================================================
+    match /orders/{orderId} {
+      // Read: Customer can read only their own orders; Barista and Admin can read all orders
+      allow read: if isBarista() || (isAuthenticated() && (
+        ('customer_id' in resource.data && resource.data.customer_id == request.auth.uid) ||
+        ('customerId' in resource.data && resource.data.customerId == request.auth.uid) ||
+        ('userId' in resource.data && resource.data.userId == request.auth.uid)
+      ));
+
+      // Create:
+      // - Authenticated customer creating legitimate pickup order for their own UID
+      // - Initial status must be 'pending' or 'confirmed'
+      // - Initial payment status must be 'UNPAID', 'unpaid', 'pending', or 'PENDING' (NEVER 'PAID')
+      // - Customer CANNOT pre-populate server-only payment verification fields (paid_at, payment_reference, checkout_session_id, etc.)
+      // - First-order GCash enforcement: if customer has not completed their first order, payment_method must be GCash and payment_status PENDING
+      // - Total amount must be positive and capped <= 100,000
+      // - Items list must be bounded between 1 and 50
+      // - Staff/Admin can also create orders
+      allow create: if (
+                      (
+                        isAuthenticated()
+                        && isAccountActive()
+                        && (
+                          ('customer_id' in request.resource.data && request.resource.data.customer_id == request.auth.uid) ||
+                          ('customerId' in request.resource.data && request.resource.data.customerId == request.auth.uid) ||
+                          ('userId' in request.resource.data && request.resource.data.userId == request.auth.uid)
+                        )
+                        && (request.resource.data.get('status', 'pending') in ['pending', 'confirmed'])
+                        && (
+                          request.resource.data.get('payment_status', request.resource.data.get('paymentStatus', 'unpaid')) in ['unpaid', 'UNPAID', 'pending', 'PENDING']
+                        )
+                        && !request.resource.data.keys().hasAny([
+                          'paid_at', 'paidAt',
+                          'payment_reference', 'paymentReference',
+                          'checkout_session_id', 'checkoutSessionId',
+                          'payment_verified', 'amount_paid'
+                        ])
+                        && (
+                          hasCompletedFirstOrder() ||
+                          (
+                            request.resource.data.get('payment_method', request.resource.data.get('paymentMethod', '')) in ['GCash', 'gcash'] &&
+                            request.resource.data.get('payment_status', request.resource.data.get('paymentStatus', '')) in ['pending', 'PENDING']
+                          )
+                        )
+                        && (
+                          ('total_amount' in request.resource.data && request.resource.data.total_amount is number && request.resource.data.total_amount > 0 && request.resource.data.total_amount <= 100000) ||
+                          ('totalAmount' in request.resource.data && request.resource.data.totalAmount is number && request.resource.data.totalAmount > 0 && request.resource.data.totalAmount <= 100000) ||
+                          ('total' in request.resource.data && request.resource.data.total is number && request.resource.data.total > 0 && request.resource.data.total <= 100000)
+                        )
+                        && ('items' in request.resource.data && request.resource.data.items is list && request.resource.data.items.size() > 0 && request.resource.data.items.size() <= 50)
+                        && (
+                          !('notes' in request.resource.data) ||
+                          request.resource.data.notes == null ||
+                          (request.resource.data.notes is string && request.resource.data.notes.size() <= 500)
+                        )
+                      )
+                      || isBarista()
+                    );
+
+      // Update:
+      // - Customer can ONLY cancel their own order before it is completed or enters preparation
+      // - Customer CANNOT modify payment_status to PAID/PENDING, totals, items, or payment verification fields
+      // - Barista and Admin can perform authorized operational transitions and update counter payment to PAID
+      // - Staff CANNOT manually mark an unverified GCash order as PAID or completed (must be verified by PayMongo backend)
+      // - Staff CANNOT advance a FAILED, EXPIRED, or CANCELLED GCash order into preparation/ready/completed
+      // - Staff CANNOT tamper with customer_id, order totals, or items during status/payment updates
+      allow update: if (
+                      isBarista()
+                      && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                        'customer_id', 'customerId', 'total_amount', 'totalAmount', 'subtotal', 'items'
+                      ])
+                      && !(
+                        resource.data.get('payment_method', resource.data.get('paymentMethod', '')) in ['GCash', 'gcash'] &&
+                        !(resource.data.get('payment_status', resource.data.get('paymentStatus', '')) in ['paid', 'PAID']) &&
+                        (
+                          request.resource.data.get('payment_status', request.resource.data.get('paymentStatus', '')) in ['paid', 'PAID'] ||
+                          request.resource.data.get('status', '') == 'completed'
+                        )
+                      )
+                      && !(
+                        resource.data.get('payment_method', resource.data.get('paymentMethod', '')) in ['GCash', 'gcash'] &&
+                        resource.data.get('payment_status', resource.data.get('paymentStatus', '')) in ['FAILED', 'failed', 'EXPIRED', 'expired', 'CANCELLED', 'cancelled'] &&
+                        request.resource.data.get('status', '') != 'cancelled'
+                      )
+                    ) || (
+                      isAuthenticated()
+                      && isAccountActive()
+                      && (
+                        ('customer_id' in resource.data && resource.data.customer_id == request.auth.uid) ||
+                        ('customerId' in resource.data && resource.data.customerId == request.auth.uid)
+                      )
+                      && (
+                        !('customer_id' in request.resource.data) ||
+                        request.resource.data.customer_id == resource.data.customer_id
+                      )
+                      && (
+                        !('customerId' in request.resource.data) ||
+                        request.resource.data.customerId == resource.data.customerId
+                      )
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'payment_status', 'status_updated_at', 'updated_at'])
+                      && (
+                        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['payment_status']) ||
+                        (
+                          !(resource.data.get('payment_status', resource.data.get('paymentStatus', '')) in ['paid', 'PAID']) &&
+                          request.resource.data.get('payment_status', '') in ['CANCELLED', 'cancelled']
+                        )
+                      )
+                      && request.resource.data.get('status', '') == 'cancelled'
+                      && resource.data.get('status', '') in ['pending', 'confirmed']
+                    );
+
+      // Delete: Admin only (audit trail compliance)
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 5. Concierge Chat Conversations & Messages
+    // =========================================================================
+    match /conversations/{conversationId} {
+      // Read: Customer reads only their own thread; Authorized Staff/Admin can read all
+      allow read: if isDirectConversationOwner(conversationId) || canAccessInbox() || isConversationOwner(conversationId);
+
+      // Create:
+      // - Customer can open conversation bound to their own authenticated UID
+      // - Authorized Staff/Admin can provision or initialize conversations
+      allow create: if isAuthenticated() && (
+        isDirectConversationOwner(conversationId) ||
+        (
+          (
+            ('customer_id' in request.resource.data && request.resource.data.customer_id == request.auth.uid) ||
+            ('customerId' in request.resource.data && request.resource.data.customerId == request.auth.uid)
+          ) && (
+            conversationId in ['conv_' + request.auth.uid, 'conv_cust_' + request.auth.uid] ||
+            request.resource.data.customer_id == request.auth.uid
+          )
+        ) ||
+        canAccessInbox()
+      );
+
+      // Update:
+      // - Customer can update typing status, unread counts, and last message metadata
+      // - Customer CANNOT change conversation ownership, participants, or customer_id
+      // - Authorized Staff/Admin can update conversation state
+      allow update: if (
+        isAuthenticated() && (
+          isDirectConversationOwner(conversationId) ||
+          (resource != null && (
+            ('customer_id' in resource.data && resource.data.customer_id == request.auth.uid) ||
+            ('customerId' in resource.data && resource.data.customerId == request.auth.uid)
+          ))
+        ) && (
+          // Ownership cannot be mutated
+          (!('customer_id' in request.resource.data) || !('customer_id' in resource.data) || request.resource.data.customer_id == resource.data.customer_id) &&
+          (!('customerId' in request.resource.data) || !('customerId' in resource.data) || request.resource.data.customerId == resource.data.customerId)
+        ) && (
+          // Whitelist allowed customer update keys
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'is_typing', 'isTyping',
+            'last_message', 'lastMessage',
+            'updated_at', 'updatedAt',
+            'unread_count', 'unreadCount',
+            'unread_counts_by_role',
+            'handling_mode',
+            'is_online', 'isOnline',
+            'customer_name', 'participant_name', 'order_reference'
+          ])
+        )
+      ) || canAccessInbox();
+
+      // Delete: Only Administrator can delete conversations
+      allow delete: if isAdmin();
+
+      // Messages Subcollection
+      match /messages/{messageId} {
+        // Read:
+        // - Customer reads messages from own parent conversation
+        // - Authorized staff can read messages
+        allow read: if isDirectConversationOwner(conversationId) || canAccessInbox() || isConversationOwner(conversationId);
+
+        // Create:
+        // - MANDATORY: sender_id MUST equal request.auth.uid (No spoofing, no exceptions!)
+        // - Initial concierge welcome message allowed for new conversation setup
+        // - Caller must be owner of parent conversation OR authorized staff
+        // - Role validation: Customer role cannot claim barista/admin role
+        // - Message text bounded between 1 and 2000 chars
+        // - Attachment URL bounded <= 1000 chars if present
+        allow create: if isAuthenticated()
+                      && (
+                        (
+                          // 1. Universal Identity Enforcement (Every sender signs with their own UID)
+                          (
+                            ('sender_id' in request.resource.data && request.resource.data.sender_id == request.auth.uid) ||
+                            ('senderId' in request.resource.data && request.resource.data.senderId == request.auth.uid)
+                          )
+                          // 2. Participant Authorization
+                          && (
+                            (
+                              (isDirectConversationOwner(conversationId) || isConversationOwner(conversationId)) &&
+                              (!('sender_role' in request.resource.data) || request.resource.data.sender_role == 'customer')
+                            )
+                            ||
+                            (
+                              canAccessInbox() &&
+                              (!('sender_role' in request.resource.data) || request.resource.data.sender_role in ['barista', 'employee', 'staff', 'admin'])
+                            )
+                          )
+                        )
+                        ||
+                        (
+                          // 3. Initial welcome message or Concierge AI automated reply for the conversation owner
+                          (isDirectConversationOwner(conversationId) || isConversationOwner(conversationId)) &&
+                          (
+                            (messageId.matches('msg_welcome_.*') && request.resource.data.sender_id in ['barista_hiro', 'system']) ||
+                            (messageId.matches('msg_ai_.*') && request.resource.data.sender_id == 'lambac_concierge_ai' && request.resource.data.get('is_ai_generated', false) == true)
+                          )
+                        )
+                      )
+                      // 3. Message Body Type & Boundary Constraints
+                      && request.resource.data.text is string
+                      && request.resource.data.text.size() > 0
+                      && request.resource.data.text.size() <= 2000
+                      && (
+                        !('attachment_url' in request.resource.data) ||
+                        (request.resource.data.attachment_url is string && request.resource.data.attachment_url.size() <= 1000)
+                      );
+
+        // Update:
+        // - Read receipts and delivery status flags ONLY
+        // - Message content, sender, role, and timestamp are strictly IMMUTABLE
+        // - Caller must be parent conversation owner or authorized staff
+        allow update: if (isConversationOwner(conversationId) || canAccessInbox())
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'is_read', 'read_at', 'status', 'isRead', 'readAt'
+                      ]);
+
+        // Delete: Admin only
+        allow delete: if isAdmin();
+      }
+    }
+
+    // =========================================================================
+    // 6. Centralized Sales Ledger
+    // =========================================================================
+    match /sales/{saleId} {
+      // Read: Barista and Admin can view sales transactions; Customers CANNOT view sales
+      allow read: if isBarista();
+
+      // Create: Validated staff sale (POS or Order completion)
+      // Staff attribution required, valid positive amount <= 100000, valid items list
+      allow create: if canRecordSales()
+                    && request.resource.data.total_amount is number
+                    && request.resource.data.total_amount > 0
+                    && request.resource.data.total_amount <= 100000
+                    && request.resource.data.items is list
+                    && request.resource.data.items.size() > 0
+                    && request.resource.data.items.size() <= 100
+                    && (
+                      !('staff_id' in request.resource.data) ||
+                      request.resource.data.staff_id == request.auth.uid ||
+                      isAdmin()
+                    );
+
+      // Update: Admin for voids/corrections, or authorized staff/barista updating payment/completion metadata
+      allow update: if isAdmin() || canRecordSales();
+
+      // Delete: Admin only (for financial audit compliance)
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 7. Roast Batch Scheduling & Operational Queue (/roastSchedules)
+    // =========================================================================
+    match /roastSchedules/{scheduleId} {
+      // Read: Barista and Admin can view roasting schedule
+      allow read: if isBarista();
+
+      // Create: Admin only (Head Roaster / Operations Admin)
+      allow create: if isAdmin()
+                    && request.resource.data.target_quantity is number
+                    && request.resource.data.target_quantity > 0;
+
+      // Update: Admin can manage full schedule; Barista can update operational status only
+      allow update: if isAdmin() || (
+                      isBarista() &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'status', 'updated_at', 'audit_logs', 'completed_at', 'cancelled_at', 'scheduled_at', 'notes'
+                      ]) &&
+                      request.resource.data.get('status', '') in [
+                        'queued', 'in_progress', 'scheduled', 'completed', 'cancelled'
+                      ]
+                    );
+
+      // Delete: Admin only (Historical roast records are immutable to ordinary staff)
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 8. Raw Ingredients, Inventory & Stock Movement (/inventory, /ingredients, /stockMovements)
+    // =========================================================================
+    match /inventory/{itemId} {
+      allow read: if isBarista();
+      allow create, update: if isAdmin() || (
+        isBarista() &&
+        request.resource.data.quantity is number &&
+        request.resource.data.quantity >= 0
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /ingredients/{ingredientId} {
+      allow read: if isBarista();
+      allow create, update: if isAdmin() || (
+        isBarista() &&
+        request.resource.data.quantity is number &&
+        request.resource.data.quantity >= 0
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /stockMovements/{movementId} {
+      allow read: if isBarista();
+      allow create: if isBarista() &&
+                    request.resource.data.quantity is number &&
+                    request.resource.data.staff_id == request.auth.uid;
+      // Historical stock movements are permanent audit records
+      allow update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 9. Forecasting Benchmarks Audit Collection (/forecastingBenchmarks)
+    // =========================================================================
+    match /forecastingBenchmarks/{benchmarkId} {
+      // Read: Barista and Admin can view benchmark metrics for operational dashboards
+      allow read: if isBarista();
+
+      // Write (Create, Update, Delete): Strictly Administrator
+      // Baristas and Customers cannot manipulate or rewrite benchmark history
+      allow create, update, delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 10. Product Community Reviews (/reviews)
+    // =========================================================================
+    match /reviews/{reviewId} {
+      // Read: Public for non-flagged reviews; Staff/Admin can read all
+      allow read: if resource.data.get('is_flagged', false) == false || isBarista();
+
+      // Create: Authenticated customer submits review for their own UID
+      allow create: if isAuthenticated()
+                    && request.resource.data.customer_id == request.auth.uid
+                    && request.resource.data.rating is int
+                    && request.resource.data.rating >= 1
+                    && request.resource.data.rating <= 5
+                    && request.resource.data.comment is string
+                    && request.resource.data.comment.size() >= 2
+                    && request.resource.data.comment.size() <= 1000
+                    && request.resource.data.product_id is string
+                    && request.resource.data.get('is_flagged', false) == false;
+
+      // Update:
+      // - Admin can perform authorized moderation (flagging/unflagging, reason)
+      // - Review Author (Customer) can ONLY edit rating and comment (ownership, product_id, moderation status are immutable)
+      // - Baristas CANNOT alter ratings or perform moderation unless they are Admin
+      allow update: if isAdmin() || (
+                      isAuthenticated()
+                      && resource.data.customer_id == request.auth.uid
+                      && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                        'customer_id', 'product_id', 'is_flagged', 'flagged_by', 'flagged_at', 'flag_reason',
+                        'is_verified_purchase', 'order_id'
+                      ])
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'rating', 'comment', 'updated_at', 'customer_name'
+                      ])
+                      && (!('rating' in request.resource.data) || (request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5))
+                      && (!('comment' in request.resource.data) || (request.resource.data.comment is string && request.resource.data.comment.size() >= 2 && request.resource.data.comment.size() <= 1000))
+                    );
+
+      // Delete: Author or Admin
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.customer_id == request.auth.uid);
+    }
+
+    // =========================================================================
+    // 11. Audit Email Queue Collection (/mail)
+    // =========================================================================
+    match /mail/{mailId} {
+      // Read & Update: Strictly Administrator (Raw OTPs are NEVER readable by ordinary staff or customers)
+      allow read, update: if isAdmin();
+      allow delete: if isAdmin();
+
+      // Create: Narrowly scoped dispatch audit with strict payload boundaries
+      allow create: if request.resource.data.keys().hasOnly([
+                      'to', 'recipient_email', 'recipient_name', 'subject',
+                      'otp', 'action', 'type', 'created_at', 'delivery_status',
+                      'message', 'template'
+                    ])
+                    && request.resource.data.to is string
+                    && request.resource.data.to.size() <= 254
+                    && (
+                      !('otp' in request.resource.data) ||
+                      (request.resource.data.otp is string && request.resource.data.otp.size() == 6)
+                    )
+                    && (
+                      !('action' in request.resource.data) ||
+                      request.resource.data.action in ['registration_otp', 'login_otp']
+                    );
+    }
+
+    // =========================================================================
+    // 12. Security Audit Logs (/auditLogs)
+    // =========================================================================
+    match /auditLogs/{logId} {
+      // Read: Strictly restricted to Administrators
+      allow read: if isAdmin();
+
+      // Create: Authenticated actor; strictly blocks inclusion of passwords or tokens
+      allow create: if isAuthenticated() &&
+                    (!('actor_uid' in request.resource.data) || request.resource.data.actor_uid == request.auth.uid || isAdmin()) &&
+                    (!('password' in request.resource.data)) &&
+                    (!('token' in request.resource.data));
+
+      // Immutable: No tampering or deleting historical security logs
+      allow update, delete: if false;
+    }
+
+    // =========================================================================
+    // 13. Protected System Roles Registry (/systemRoles)
+    // =========================================================================
+    match /systemRoles/{roleDoc} {
+      // Read: Authenticated actors can verify platform authorization
+      allow read: if isAuthenticated();
+
+      // Write: Strictly immutable from ordinary client apps (Server Admin SDK / Cloud Functions only)
+      allow write: if false;
+    }
+
+    // =========================================================================
+    // 14. First-Order GCash Reservation Lock (/first_order_reservations)
+    // =========================================================================
+    match /first_order_reservations/{userId} {
+      allow read: if isOwner(userId) || isBarista();
+      allow create, update: if isOwner(userId)
+                            && isAccountActive()
+                            && request.resource.data.get('customer_id', userId) == userId
+                            && request.resource.data.get('status', '') in ['ACTIVE_PENDING', 'CANCELLED', 'RELEASED_FOR_RETRY']
+                            && (resource == null || resource.data.get('status', '') != 'COMPLETED');
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 15. PayMongo Webhook Idempotency Ledger (/payment_webhook_events)
+    // =========================================================================
+    match /payment_webhook_events/{eventId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // =========================================================================
+    // 16. Default Deny Catch-All Rule
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

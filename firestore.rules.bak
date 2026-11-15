@@ -1,0 +1,413 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function userDocExists() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        ((request.auth.token.email == 'jmbautista0228@gmail.com' || request.auth.token.email == 'jmbautistaa0428@gmail.com') && request.auth.token.email_verified == true) ||
+        (userDocExists() && getUserData().role == 'super_admin')
+      );
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        isSuperAdmin() ||
+        (userDocExists() && (getUserData().role == 'admin' || getUserData().role == 'administrator'))
+      );
+    }
+
+    function isStaff() {
+      return isAuthenticated() && (
+        isAdmin() ||
+        (userDocExists() && (getUserData().role == 'employee' || getUserData().role == 'staff' || getUserData().role == 'barista'))
+      );
+    }
+
+    // ----------------------------------------------------
+    // User Profiles Collection
+    // ----------------------------------------------------
+    match /users/{userId} {
+      // 1. Read: User can read own profile; verified email owner can read; Staff and Admin can view all
+      allow read: if isOwner(userId)
+                  || (isAuthenticated() && resource.data.email == request.auth.token.email)
+                  || isStaff();
+
+      // 2. Create: User can create their own profile during registration (strictly restricted to customer, zero permissions, capped loyalty points)
+      // Admins can provision accounts (employee, staff, barista, admin); verified bootstrap admins are recognized
+      allow create: if (
+                      // Case A: User self-registration (Customer or verified bootstrap emails)
+                      (
+                        isOwner(userId) && (
+                          (
+                            request.resource.data.role == 'customer'
+                            && (!('permissions' in request.resource.data) || request.resource.data.permissions.size() == 0)
+                            && (!('loyaltyPoints' in request.resource.data) || request.resource.data.loyaltyPoints <= 50)
+                            && (!('loyalty_points' in request.resource.data) || request.resource.data.loyalty_points <= 50)
+                            && (!('fullName' in request.resource.data) || (request.resource.data.fullName is string && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 100))
+                            && (!('full_name' in request.resource.data) || (request.resource.data.full_name is string && request.resource.data.full_name.size() >= 2 && request.resource.data.full_name.size() <= 100))
+                            && (!('email' in request.resource.data) || (request.resource.data.email is string && request.resource.data.email.size() <= 254))
+                          ) || (
+                            (request.auth.token.email == 'jmbautista0228@gmail.com' || request.auth.token.email == 'jmbautistaa0428@gmail.com')
+                            && request.auth.token.email_verified == true
+                          )
+                        )
+                      )
+                      ||
+                      // Case B: Administrator provisioning accounts (employee, staff, barista, admin)
+                      (
+                        isAdmin() && (request.resource.data.role != 'super_admin' || isSuperAdmin())
+                      )
+                    )
+                    && (
+                      !('id' in request.resource.data) ||
+                      request.resource.data.id == userId ||
+                      request.resource.data.uid == userId
+                    );
+
+      // 3. Update: User can only update non-privilege profile fields
+      // Strictly blocks role escalation, status tampering, permission tampering, registration verification tampering, and loyalty point self-awarding
+      allow update: if (isOwner(userId) &&
+                        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                          'role', 'status', 'isActive', 'permissions', 'uid', 'email',
+                          'loyaltyPoints', 'loyalty_points', 'mustChangePassword', 'must_change_password',
+                          'createdAt', 'created_at',
+                          'is_registration_verified', 'isRegistrationVerified', 'registration_verified',
+                          'registration_verified_at', 'registrationVerifiedAt'
+                        ]))
+                    || (isAdmin() && (
+                         (resource.data.role != 'super_admin' && request.resource.data.role != 'super_admin') || isSuperAdmin()
+                       ));
+
+      // 4. Delete: User deleting own account or Admin (SUPER_ADMIN can only be deleted by another super_admin)
+      allow delete: if (isOwner(userId) && resource.data.role != 'super_admin')
+                    || (isAdmin() && (resource.data.role != 'super_admin' || isSuperAdmin()));
+
+      // User Favorites Subcollection: users/{userId}/favorites/{productId}
+      match /favorites/{productId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // User In-App Notifications: users/{userId}/notifications/{notificationId}
+      match /notifications/{notificationId} {
+        // Customer can only read own notifications; staff can inspect
+        allow read: if isOwner(userId) || isStaff();
+
+        // System or staff can create notifications; user can queue self-notifications for legitimate local events
+        allow create: if isStaff()
+                      || (isOwner(userId)
+                          && (!('user_id' in request.resource.data)
+                              || request.resource.data.user_id == userId
+                              || request.resource.data.userId == userId));
+
+        // Customers can ONLY update read status (is_read, read_at, isRead, readAt); staff can update
+        allow update: if isStaff()
+                      || (isOwner(userId)
+                          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['is_read', 'read_at', 'isRead', 'readAt']));
+
+        // Customer can dismiss/delete own notification; staff can delete
+        allow delete: if isOwner(userId) || isStaff();
+      }
+
+      // User Preferences Subcollection
+      match /preferences/{prefId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // ----------------------------------------------------
+    // Product Reviews Collection
+    // ----------------------------------------------------
+    match /reviews/{reviewId} {
+      // 1. Read: Public for non-flagged community reviews; Staff and Admin can view all
+      allow read: if resource.data.is_flagged != true || isStaff();
+
+      // 2. Create: Authenticated customer can submit review for their own UID with type and length bounds
+      allow create: if isAuthenticated()
+                    && (request.resource.data.customer_id == request.auth.uid || isStaff())
+                    && request.resource.data.rating is int
+                    && request.resource.data.rating >= 1
+                    && request.resource.data.rating <= 5
+                    && request.resource.data.comment is string
+                    && request.resource.data.comment.size() >= 3
+                    && request.resource.data.comment.size() <= 1000
+                    && request.resource.data.product_id is string
+                    && request.resource.data.product_id.size() > 0
+                    && request.resource.data.product_id.size() <= 128;
+
+      // 3. Update: Author updating own review (cannot alter customer_id, product_id, or unflag flagged reviews)
+      allow update: if isStaff()
+                    || (isAuthenticated()
+                        && resource.data.customer_id == request.auth.uid
+                        && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                          'customer_id', 'product_id', 'is_flagged', 'flagged_by', 'flagged_at', 'flag_reason'
+                        ])
+                        && (!('rating' in request.resource.data) || (request.resource.data.rating is int && request.resource.data.rating >= 1 && request.resource.data.rating <= 5))
+                        && (!('comment' in request.resource.data) || (request.resource.data.comment is string && request.resource.data.comment.size() >= 3 && request.resource.data.comment.size() <= 1000)));
+
+      // 4. Delete: Author deleting own review or Admin
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.customer_id == request.auth.uid);
+    }
+
+    // ----------------------------------------------------
+    // Product Categories Collection
+    // ----------------------------------------------------
+    match /categories/{categoryId} {
+      // Anyone can read product categories for catalog browsing
+      allow read: if true;
+
+      // Only authorized staff/admin roles can create, update, or delete categories
+      allow create, update, delete: if isStaff() || isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Products Collection
+    // ----------------------------------------------------
+    match /products/{productId} {
+      // Anyone can read products for catalog browsing and detail viewing
+      allow read: if true;
+
+      // Only authorized staff/admin roles can create, update, or soft-delete products.
+      // Strict schema boundaries: name 2-120 chars, price > 0 and <= 50,000, stock >= 0 and <= 1,000,000, description <= 2000 chars.
+      allow create, update: if (isStaff() || isAdmin())
+                            && request.resource.data.name is string
+                            && request.resource.data.name.size() >= 2
+                            && request.resource.data.name.size() <= 120
+                            && (
+                              (request.resource.data.base_price is number && request.resource.data.base_price > 0 && request.resource.data.base_price <= 50000)
+                              || (request.resource.data.price is number && request.resource.data.price > 0 && request.resource.data.price <= 50000)
+                            )
+                            && (
+                              !('stock_quantity' in request.resource.data)
+                              || (request.resource.data.stock_quantity is int && request.resource.data.stock_quantity >= 0 && request.resource.data.stock_quantity <= 1000000)
+                              || (request.resource.data.stock is int && request.resource.data.stock >= 0 && request.resource.data.stock <= 1000000)
+                            )
+                            && (
+                              !('description' in request.resource.data)
+                              || (request.resource.data.description is string && request.resource.data.description.size() <= 2000)
+                            );
+
+      allow delete: if isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Orders Collection
+    // ----------------------------------------------------
+    match /orders/{orderId} {
+      // 1. Read: Customer can only read their own orders; Staff and Admin can view all roastery orders
+      allow read: if isStaff() || (isAuthenticated() && (
+        ('customer_id' in resource.data && resource.data.customer_id == request.auth.uid) ||
+        ('customerId' in resource.data && resource.data.customerId == request.auth.uid) ||
+        ('userId' in resource.data && resource.data.userId == request.auth.uid)
+      ));
+
+      // 2. Create: Customer can create orders for their own authenticated UID; initial status must be pending or confirmed
+      // Payment status MUST be unpaid/pending upon customer creation to prevent payment spoofing
+      // Caps total amount <= 100,000, items <= 50, notes <= 500 chars
+      allow create: if isAuthenticated()
+                    && (
+                      (
+                        (
+                          ('customer_id' in request.resource.data && request.resource.data.customer_id == request.auth.uid) ||
+                          ('customerId' in request.resource.data && request.resource.data.customerId == request.auth.uid) ||
+                          ('userId' in request.resource.data && request.resource.data.userId == request.auth.uid)
+                        )
+                        && (request.resource.data.status == 'pending' || request.resource.data.status == 'confirmed')
+                        && (
+                          ('payment_status' in request.resource.data && request.resource.data.payment_status in ['unpaid', 'UNPAID', 'pending']) ||
+                          ('paymentStatus' in request.resource.data && request.resource.data.paymentStatus in ['unpaid', 'UNPAID', 'pending'])
+                        )
+                        && (
+                          ('total_amount' in request.resource.data && request.resource.data.total_amount is number && request.resource.data.total_amount > 0 && request.resource.data.total_amount <= 100000) ||
+                          ('totalAmount' in request.resource.data && request.resource.data.totalAmount is number && request.resource.data.totalAmount > 0 && request.resource.data.totalAmount <= 100000) ||
+                          ('total' in request.resource.data && request.resource.data.total is number && request.resource.data.total > 0 && request.resource.data.total <= 100000)
+                        )
+                        && request.resource.data.items is list
+                        && request.resource.data.items.size() > 0
+                        && request.resource.data.items.size() <= 50
+                        && (
+                          !('notes' in request.resource.data)
+                          || (request.resource.data.notes is string && request.resource.data.notes.size() <= 500)
+                        )
+                      )
+                      || isStaff()
+                    );
+
+      // 3. Update: Only Staff and Admin can advance order status and update counter payments.
+      // Customer cannot alter pricing, items, or arbitrarily mark orders completed.
+      // Customer can ONLY cancel their own order before it enters brewing/preparation (pending or confirmed).
+      allow update: if isStaff()
+                    || (isAuthenticated()
+                        && (
+                          ('customer_id' in resource.data && resource.data.customer_id == request.auth.uid) ||
+                          ('customerId' in resource.data && resource.data.customerId == request.auth.uid)
+                        )
+                        && (
+                          !('customer_id' in request.resource.data) ||
+                          request.resource.data.customer_id == resource.data.customer_id
+                        )
+                        && (
+                          !('customerId' in request.resource.data) ||
+                          request.resource.data.customerId == resource.data.customerId
+                        )
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'status_updated_at', 'updated_at'])
+                        && request.resource.data.status == 'cancelled'
+                        && resource.data.status in ['pending', 'confirmed']);
+
+      // 4. Delete: Only Admin can delete order records (audit compliance)
+      allow delete: if isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Concierge Chat Conversations & Messages
+    // ----------------------------------------------------
+    match /conversations/{conversationId} {
+      // 1. Read: Customer can read only their own conversation; Staff and Admin can read all
+      allow read: if isStaff() || (isAuthenticated() && resource.data.customer_id == request.auth.uid);
+
+      // 2. Create: Customer can start conversation for own UID only; Staff/Admin can create
+      allow create: if isAuthenticated() && (
+        (request.resource.data.customer_id == request.auth.uid) || isStaff()
+      );
+
+      // 3. Update: Staff/Admin can update; Customer can update own conversation BUT cannot alter customer_id
+      allow update: if isStaff() || (
+        isAuthenticated()
+        && resource.data.customer_id == request.auth.uid
+        && request.resource.data.customer_id == resource.data.customer_id
+      );
+
+      // 4. Delete: Only Admin
+      allow delete: if isAdmin();
+
+      // Messages Subcollection
+      match /messages/{messageId} {
+        // Customer can read messages if they own the parent conversation; Staff/Admin can read all
+        allow read: if isStaff()
+                    || (isAuthenticated()
+                        && get(/databases/$(database)/documents/conversations/$(conversationId)).data.customer_id == request.auth.uid);
+
+        // Sender can write as themselves with string length boundary (1-2000 chars); Staff can write; Concierge AI & welcome template authorized
+        allow create: if isAuthenticated() && (
+          isStaff() || (
+            // Option A: Legitimate Customer message with text length constraints
+            request.resource.data.sender_id == request.auth.uid
+            && request.resource.data.sender_role == 'customer'
+            && request.resource.data.text is string
+            && request.resource.data.text.size() > 0
+            && request.resource.data.text.size() <= 2000
+            && (!exists(/databases/$(database)/documents/conversations/$(conversationId))
+                || get(/databases/$(database)/documents/conversations/$(conversationId)).data.customer_id == request.auth.uid)
+          ) || (
+            // Option B: Authorized Concierge AI / Welcome template in own conversation
+            (!exists(/databases/$(database)/documents/conversations/$(conversationId))
+             || get(/databases/$(database)/documents/conversations/$(conversationId)).data.customer_id == request.auth.uid)
+            && (
+              (request.resource.data.sender_id == 'lambac_concierge_ai' && request.resource.data.is_ai_generated == true && messageId.matches('msg_ai_.*'))
+              || (request.resource.data.sender_id == 'barista_hiro' && messageId.matches('msg_welcome_.*'))
+            )
+          )
+        );
+
+        // Updating message status / read status only for customers; staff can update
+        allow update: if isStaff()
+                      || (isAuthenticated()
+                          && get(/databases/$(database)/documents/conversations/$(conversationId)).data.customer_id == request.auth.uid
+                          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['is_read', 'read_at', 'status']));
+
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ----------------------------------------------------
+    // Centralized Sales Ledger Collection
+    // ----------------------------------------------------
+    match /sales/{saleId} {
+      // 1. Read: Staff and Admin can view the centralized sales ledger
+      allow read: if isStaff();
+
+      // 2. Create: Authorized Staff/Admin or order completion lifecycle
+      allow create: if isStaff();
+
+      // 3. Update: Authorized Staff/Admin can void or update notes
+      allow update: if isStaff();
+
+      // 4. Delete: Only Admin
+      allow delete: if isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Roast Batch Scheduling & Operational Actions Collection
+    // ----------------------------------------------------
+    match /roastSchedules/{scheduleId} {
+      // 1. Read: Staff and Admin can view scheduled batches and queue
+      allow read: if isStaff();
+
+      // 2. Create: Authorized Staff/Admin can schedule roast batches and queue actions
+      allow create: if isStaff();
+
+      // 3. Update: Staff can update status, reschedule, and append audit logs
+      allow update: if isStaff();
+
+      // 4. Delete: Only Admin
+      allow delete: if isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Forecasting Benchmarks Audit Collection
+    // ----------------------------------------------------
+    match /forecastingBenchmarks/{benchmarkId} {
+      allow read, write: if isStaff();
+    }
+
+    // ----------------------------------------------------
+    // Trigger Email Extension Collection (firestore-send-email)
+    // ----------------------------------------------------
+    match /mail/{mailId} {
+      // 1. Create: Staff/Admin or strictly formatted registration OTP audit
+      allow create: if isStaff()
+                    || (
+                      request.resource.data.to is string
+                      && request.resource.data.otp is string
+                      && request.resource.data.subject == 'Verify Your Lambac Coffee Roastery Account'
+                    );
+
+      // 2. Read & Update: Restricted to Staff/Admin and backend extensions
+      allow read, update: if isStaff();
+      allow delete: if isAdmin();
+    }
+
+    // ----------------------------------------------------
+    // Immutable Security & Operational Audit Trail
+    // ----------------------------------------------------
+    match /auditLogs/{logId} {
+      // Read: Strictly restricted to Administrators
+      allow read: if isAdmin();
+
+      // Create: Authenticated actor; actor_uid must match caller or be admin; strictly prevents password/token inclusion
+      allow create: if isAuthenticated() &&
+                    (!('actor_uid' in request.resource.data) || request.resource.data.actor_uid == request.auth.uid || isAdmin()) &&
+                    (!('password' in request.resource.data)) &&
+                    (!('token' in request.resource.data));
+
+      // Immutable: No tampering or deleting historical security logs
+      allow update, delete: if false;
+    }
+  }
+}

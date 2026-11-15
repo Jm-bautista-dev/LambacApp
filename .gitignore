@@ -1,0 +1,66 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Visual Studio Code related
+.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# Symbol processing related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will create this file for you.
+local.properties
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+functions/.env
+functions/.env.*
+*service-account*.json
+*firebase-adminsdk*.json
+# Keystore and signing properties
+*.keystore
+*.jks
+*.p12
+*.key
+**/key.properties
+android/key.properties
+android/app/*.jks
+android/app/*.keystore
+google-services.json
+GoogleService-Info.plist
+
+# Coverage
+coverage/

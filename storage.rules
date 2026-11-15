@@ -1,0 +1,78 @@
+﻿rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isStaff() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'jmbautista0228@gmail.com' ||
+        request.auth.token.email == 'jmbautistaa0428@gmail.com' ||
+        request.auth.token.role == 'admin' ||
+        request.auth.token.role == 'employee' ||
+        request.auth.token.role == 'barista' ||
+        request.auth.token.role == 'staff' ||
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role in ['admin', 'super_admin', 'employee', 'barista', 'staff']
+      );
+    }
+
+    function isValidProductImage() {
+      return request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024 // Max 5MB strict limit
+        && request.resource.contentType.matches('image/(jpeg|png|webp)');
+    }
+
+    function isValidAvatarImage() {
+      return request.resource.size > 0
+        && request.resource.size <= 5 * 1024 * 1024 // Max 5MB strict limit
+        && request.resource.contentType.matches('image/(jpeg|png|webp)');
+    }
+
+    function isSafeFilename(name) {
+      return name.matches('^[a-zA-Z0-9_\\-\\.]+$') && !name.matches('.*\\.\\..*');
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Product Catalog Images (/products/{filename} or /products/{productId}/{filename})
+    // -------------------------------------------------------------------------
+    match /products/{filename} {
+      // Public read for customer catalog browsing and detail viewing
+      allow read: if true;
+
+      // Only authorized Staff and Admin can upload, replace, or delete product images
+      // Validates mime type (jpeg|png|webp), 5MB size limit, and path safety
+      allow write: if isStaff() && isValidProductImage() && isSafeFilename(filename);
+      allow delete: if isStaff();
+    }
+
+    match /products/{productId}/{filename} {
+      allow read: if true;
+      allow write: if isStaff() && isValidProductImage() && isSafeFilename(filename);
+      allow delete: if isStaff();
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. User Profile Avatars (/users/{userId}/{filename})
+    // -------------------------------------------------------------------------
+    match /users/{userId}/{filename} {
+      // Public read for chat avatar rendering; user can write only their own avatar
+      allow read: if true;
+      allow write: if isOwner(userId) && isValidAvatarImage() && isSafeFilename(filename);
+      allow delete: if isOwner(userId) || isStaff();
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Default Deny for All Other Storage Buckets and Paths
+    // -------------------------------------------------------------------------
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

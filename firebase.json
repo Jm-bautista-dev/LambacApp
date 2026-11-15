@@ -1,0 +1,56 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "emulators": {
+    "firestore": {
+      "port": 8080
+    },
+    "storage": {
+      "port": 9199
+    },
+    "auth": {
+      "port": 9099
+    },
+    "ui": {
+      "enabled": false
+    }
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "lambac-coffee-roastery",
+          "appId": "1:122572066362:android:f7fa36af4f79a6ce5a6f03",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "lambac-coffee-roastery",
+          "configurations": {
+            "android": "1:122572066362:android:f7fa36af4f79a6ce5a6f03",
+            "ios": "1:122572066362:ios:20b5792d1c491b305a6f03",
+            "web": "1:122572066362:web:fe445d4fa528c6735a6f03"
+          }
+        }
+      }
+    }
+  }
+}

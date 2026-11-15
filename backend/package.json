@@ -1,0 +1,20 @@
+{
+  "name": "lambac-paymongo-backend",
+  "version": "1.0.0",
+  "description": "Standalone Zero-Cost Express Backend for Lambac Coffee Roastery PayMongo GCash Integration (Firebase Spark Compatible)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_server.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "firebase-admin": "^12.7.0"
+  },
+  "private": true
+}
+
