@@ -193,7 +193,7 @@ void main() {
     test('PaymongoService targets standalone backend URL instead of Firebase Cloud Functions', () {
       final defaultService = PaymongoService();
       expect(defaultService.backendBaseUrl, isNot(contains('cloudfunctions.net')));
-      expect(defaultService.backendBaseUrl, 'https://lambac-paymongo-backend.onrender.com/api');
+      expect(defaultService.backendBaseUrl, 'https://lambacapp.onrender.com/api');
 
       final customService = PaymongoService(
         backendBaseUrl: 'https://my-custom-paymongo-host.onrender.com/api/',
@@ -269,7 +269,7 @@ void main() {
         InterceptorsWrapper(
           onRequest: (options, handler) {
             requestedUrls.add(options.uri.toString());
-            if (options.uri.toString().contains('lambac-paymongo-backend.onrender.com')) {
+            if (options.uri.toString().contains('lambacapp.onrender.com')) {
               return handler.reject(
                 DioException.connectionError(
                   requestOptions: options,
@@ -290,7 +290,7 @@ void main() {
 
       final serviceWithFallback = PaymongoService(
         dio: dio,
-        backendBaseUrl: 'https://lambac-paymongo-backend.onrender.com/api',
+        backendBaseUrl: 'https://lambacapp.onrender.com/api',
         allowLocalDevFallback: true,
       );
 
@@ -298,7 +298,7 @@ void main() {
       expect(healthRes.isSuccess, isTrue);
       expect(healthRes.dataOrNull?['status'], 'ok');
       expect(requestedUrls.length, 2);
-      expect(requestedUrls.first, 'https://lambac-paymongo-backend.onrender.com/api/health');
+      expect(requestedUrls.first, 'https://lambacapp.onrender.com/api/health');
       expect(requestedUrls.last, contains(':3000/api/health'));
     });
   });

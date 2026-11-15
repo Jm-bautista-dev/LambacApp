@@ -58,10 +58,10 @@ class PaymongoCheckoutResponse {
 /// Connects to the standalone Node.js Express PayMongo backend (compatible with Firebase Spark)
 /// to manage PayMongo Checkout Sessions, first-order GCash enforcement, and payment verification.
 class PaymongoService {
-  /// Configurable via `--dart-define=PAYMONGO_BACKEND_URL=https://your-backend-host.onrender.com/api`
+  /// Configurable via `--dart-define=PAYMONGO_BACKEND_URL=https://lambacapp.onrender.com/api`
   static const String _configuredBackendUrl = String.fromEnvironment(
     'PAYMONGO_BACKEND_URL',
-    defaultValue: 'https://lambac-paymongo-backend.onrender.com/api',
+    defaultValue: 'https://lambacapp.onrender.com/api',
   );
 
   static const bool _hasExplicitBackendUrlDefine = bool.hasEnvironment('PAYMONGO_BACKEND_URL');
@@ -132,7 +132,7 @@ class PaymongoService {
   static String _normalizeBaseUrl(String url) {
     final trimmed = url.trim();
     if (trimmed.isEmpty) {
-      return 'https://lambac-paymongo-backend.onrender.com/api';
+      return 'https://lambacapp.onrender.com/api';
     }
     if (trimmed.endsWith('/')) {
       return trimmed.substring(0, trimmed.length - 1);
