@@ -50,6 +50,11 @@ functions/.env
 functions/.env.*
 *service-account*.json
 *firebase-adminsdk*.json
+*.pem
+
+# Node.js dependencies
+node_modules/
+**/node_modules/
 # Keystore and signing properties
 *.keystore
 *.jks
